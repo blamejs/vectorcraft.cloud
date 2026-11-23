@@ -49,8 +49,10 @@ get_text() {
 # bucket_check: exits unless the bucket exists. wrangler reports a missing bucket on `r2 object get`
 # with the same message as a missing key, so the scripts check the bucket before reading STATE.
 bucket_check() {
-  wr r2 bucket info "$bucket" >/dev/null 2>"$work/bucket.err" ||
-    die "bucket $bucket cannot be read: $(grep -m 1 -E 'does not exist|ERROR' "$work/bucket.err" | tr -d '\033' | tr '\n' ' ')"
+  if ! wr r2 bucket info "$bucket" >/dev/null 2>"$work/bucket.err"; then
+    sed -e 's/\x1b\[[0-9;]*m//g' "$work/bucket.err" | grep -vE '^[[:space:]]*$|Logs were written|wrangler [0-9]|^─' >&2 || true
+    die "bucket $bucket cannot be read"
+  fi
 }
 
 # delete <key>: returns nonzero when the delete fails. A key that does not exist counts as deleted.
