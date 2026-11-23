@@ -10,9 +10,10 @@ https://vectorcraft.cloud/ serves the web build of the latest VectorCraft releas
 - `.github/workflows/publish.yml` runs every hour at minute 7. When the latest release differs from the served
   build, or the served build has not passed its check, it downloads the release's web zip and uploads it with
   `scripts/publish.sh` as a new build with the id `<tag>.<UTC time>`. It then checks the site with
-  `scripts/check.sh` and records the result with `scripts/mark-checked.sh`. When the check fails, the last build
-  that passed its check is served again (`scripts/rollback.sh`), and scheduled runs do not publish that release
-  again. `scripts/cleanup.sh` runs on every run; it keeps the last 3 builds and deletes older ones. Run the workflow
+  `scripts/check.sh` and records the result with `scripts/mark-checked.sh`. When the check shows the build is
+  wrong, the last build that passed its check is served again (`scripts/rollback.sh`), and scheduled runs do not
+  publish that release again. When the check cannot reach the site from the runner (for example Cloudflare
+  answering 403 to GitHub's addresses), the build stays live with a warning. `scripts/cleanup.sh` runs on every run; it keeps the last 3 builds and deletes older ones. Run the workflow
   by hand from the Actions tab; a tag given there is published even when it is already current or failed before,
   and the next scheduled run publishes the latest release again.
 - `scripts/current.sh web-app-site` prints `STATE`: the served build (`current=`), the build served before it

@@ -98,7 +98,18 @@ jobs:
         timeout-minutes: 12
         env:
           ID: ${{ steps.publish.outputs.id }}
-        run: scripts/check.sh "$SITE_URL" "$ID"
+        # An inconclusive check (the runner could not reach the site, for example Cloudflare answering
+        # 403 to a datacenter address) lets the build go through: publish.sh has already checked its
+        # files. Only a check that shows the build is wrong fails this step and rolls back.
+        run: |
+          set +e
+          scripts/check.sh "$SITE_URL" "$ID"
+          code=$?
+          if [[ $code == 3 ]]; then
+            echo "::warning::the site check could not reach $SITE_URL from the runner; build $ID stays live"
+            exit 0
+          fi
+          exit $code
       - name: Record the check
         if: steps.publish.outputs.id != ''
         env:
