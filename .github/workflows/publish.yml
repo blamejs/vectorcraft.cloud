@@ -1,0 +1,131 @@
+name: Publish the latest release
+
+on:
+  schedule:
+    - cron: "7 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (empty: the latest release)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  BUCKET: web-app-site
+  SITE_URL: https://vectorcraft.cloud/
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - run: npm ci
+      - name: Find the release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag=${INPUT_TAG:-$(gh api repos/storytold/vectorcraft/releases/latest --jq .tag_name)}
+          [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || { echo "unexpected tag: $tag" >&2; exit 1; }
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+      - name: Compare with the published build
+        id: compare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TAG: ${{ steps.release.outputs.tag }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          state=$(scripts/current.sh "$BUCKET")
+          current=$(printf '%s\n' "$state" | sed -n 's/^current=//p')
+          checked=$(printf '%s\n' "$state" | sed -n 's/^checked=//p')
+          failed=$(printf '%s\n' "$state" | sed -n 's/^failed=//p')
+          # A build id is <tag>.<UTC time>; the tag is everything before the time.
+          published=$(printf '%s' "$current" | sed -E 's/\.[0-9]{14}$//')
+          failed_tag=$(printf '%s' "$failed" | sed -E 's/\.[0-9]{14}$//')
+          echo "published: ${current:-nothing} (checked: ${checked:-nothing}, failed: ${failed:-nothing}), latest: $TAG"
+          if [[ -n $current && $published == "$TAG" && $checked == "$current" && -z $INPUT_TAG ]]; then
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+          elif [[ -n $current && $checked == "$current" && $failed_tag == "$TAG" && -z $INPUT_TAG ]]; then
+            # This release already failed its check; the checked build stays live until a new
+            # release, or a run by hand with the tag.
+            echo "::warning::$TAG failed its check as build $failed; not publishing it again"
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Download the web build
+        if: steps.compare.outputs.changed == 'true'
+        id: site
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          mkdir dl site
+          zip="vectorcraft-web-${TAG#v}.zip"
+          gh release download "$TAG" --repo storytold/vectorcraft --pattern "$zip" --dir dl
+          [[ -f dl/$zip ]] || { echo "$TAG has no $zip" >&2; exit 1; }
+          unzip -q "dl/$zip" -d site
+          dirs=(site/*/)
+          [[ ${#dirs[@]} -eq 1 && ! -L ${dirs[0]%/} && -f ${dirs[0]}index.html ]] || { echo "unexpected zip layout" >&2; exit 1; }
+          echo "dir=${dirs[0]%/}" >>"$GITHUB_OUTPUT"
+      - name: Publish
+        id: publish
+        if: steps.compare.outputs.changed == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TAG: ${{ steps.release.outputs.tag }}
+          DIR: ${{ steps.site.outputs.dir }}
+        run: scripts/publish.sh "$BUCKET" "$TAG" "$DIR"
+      - name: Check the site
+        id: check
+        if: steps.publish.outputs.id != ''
+        env:
+          ID: ${{ steps.publish.outputs.id }}
+        run: scripts/check.sh "$SITE_URL" "$ID"
+      - name: Record the check
+        if: steps.publish.outputs.id != ''
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          ID: ${{ steps.publish.outputs.id }}
+        run: scripts/mark-checked.sh "$BUCKET" "$ID"
+      # Only a failed or canceled site check rolls back; a failure to record a passed check leaves
+      # the build live and unchecked, and the next run checks it again.
+      - name: Roll back a build that fails its check
+        if: always() && steps.publish.outputs.id != '' && steps.check.outcome != 'success'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          ID: ${{ steps.publish.outputs.id }}
+          VERDICT: ${{ steps.check.outputs.verdict }}
+        # A check that found the build wrong marks the release as failed; an inconclusive, canceled
+        # or skipped check does not, so the next run tries the release again.
+        run: |
+          if [[ $VERDICT == bad ]]; then
+            scripts/rollback.sh "$BUCKET" "$ID"
+          else
+            scripts/rollback.sh --canceled "$BUCKET" "$ID"
+          fi
+      # Runs on every run, so a deletion that failed earlier is tried again.
+      - name: Delete old builds
+        if: always() && steps.compare.outcome == 'success'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: scripts/cleanup.sh "$BUCKET"

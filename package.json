@@ -1,0 +1,13 @@
+{
+  "name": "web-app",
+  "private": true,
+  "type": "module",
+  "description": "Serves the VectorCraft web build from R2 through a Cloudflare Worker",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "test": "node --test test/"
+  },
+  "devDependencies": {
+    "wrangler": "4.166.0"
+  }
+}
