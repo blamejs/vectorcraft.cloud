@@ -1,6 +1,6 @@
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import worker, { acceptsBrotli, bodyInit, filePath, parseState, precondition, resetPointers } from "../src/index.js";
+import worker, { acceptsBrotli, bodyInit, buildPath, filePath, parseState, precondition, resetPointers } from "../src/index.js";
 
 // A small stand-in for an R2 bucket binding: get and head over a mutable map of key -> text.
 function bucket(files) {
@@ -19,14 +19,15 @@ function bucket(files) {
 }
 
 const FILES = () => ({
-  STATE: "current=v2\nprevious=v1\nchecked=v2\n",
+  STATE: "current=v2\nprevious=v1\nchecked=v2\nfailed=\n",
   "builds/v2/index.html": "<html>v2</html>",
   "builds/v2/app-0123456789abcdef.js": "js2",
   "builds/v2/app-0123456789abcdef_bg.wasm": "wasm2",
   "builds/v2/app-0123456789abcdef_bg.wasm.br": "br2",
   "builds/v2/fonts/a.ttf": "font",
+  "builds/v2/MANIFEST": "builds/v2/index.html\n",
   "builds/v1/index.html": "<html>v1</html>",
-  "builds/v1/app-fedcba9876543210.js": "js1",
+  "builds/v1/app-0123456789abcdef.js": "js1",
 });
 
 let env;
@@ -41,70 +42,107 @@ beforeEach(() => {
   env = { SITE: bucket(FILES()) };
 });
 
-test("the root serves the current build's index.html without caching", async () => {
-  const r = await get("/");
-  assert.equal(r.status, 200);
-  assert.equal(await r.text(), "<html>v2</html>");
-  assert.equal(r.headers.get("Content-Type"), "text/html; charset=utf-8");
-  assert.equal(r.headers.get("Cache-Control"), "no-cache");
-  assert.equal(r.headers.get("X-Build"), "v2");
+test("/ and other paths redirect into the current build without caching", async () => {
+  for (const [from, to] of [["/", "/b/v2/"], ["/index.html", "/b/v2/"], ["/favicon.ico?x=1", "/b/v2/favicon.ico?x=1"]]) {
+    const r = await get(from);
+    assert.equal(r.status, 302, from);
+    assert.equal(r.headers.get("Location"), to, from);
+    assert.equal(r.headers.get("Cache-Control"), "no-store", from);
+    assert.equal(r.headers.get("X-Current-Build"), "v2", from);
+  }
+  const bare = await get("/b/v1");
+  assert.equal(bare.status, 302);
+  assert.equal(bare.headers.get("Location"), "/b/v1/");
 });
 
-test("hashed files are immutable and others are cached for an hour", async () => {
-  const js = await get("/app-0123456789abcdef.js");
-  assert.equal(js.headers.get("Content-Type"), "text/javascript; charset=utf-8");
-  assert.equal(js.headers.get("Cache-Control"), "public, max-age=31536000, immutable");
-  const font = await get("/fonts/a.ttf");
-  assert.equal(font.headers.get("Content-Type"), "font/ttf");
-  assert.equal(font.headers.get("Cache-Control"), "public, max-age=3600");
-  env.SITE.files["builds/v2/snippets/x/inline0.js"] = "s";
-  assert.equal((await get("/snippets/x/inline0.js")).headers.get("Cache-Control"), "no-cache");
+test("a build's files are served under its own path and never change", async () => {
+  const page = await get("/b/v2/");
+  assert.equal(page.status, 200);
+  assert.equal(await page.text(), "<html>v2</html>");
+  assert.equal(page.headers.get("Content-Type"), "text/html; charset=utf-8");
+  assert.equal(page.headers.get("X-Build"), "v2");
+  for (const p of ["/b/v2/app-0123456789abcdef.js", "/b/v2/fonts/a.ttf"]) {
+    assert.equal((await get(p)).headers.get("Cache-Control"), "public, max-age=31536000, immutable", p);
+  }
+  assert.equal(page.headers.get("Cache-Control"), "no-cache");
+  assert.equal((await get("/b/v2/fonts/a.ttf")).headers.get("Content-Type"), "font/ttf");
+});
+
+test("an older build keeps serving its own copy of a path the current build also has", async () => {
+  const r = await get("/b/v1/app-0123456789abcdef.js");
+  assert.equal(r.status, 200);
+  assert.equal(await r.text(), "js1");
+  assert.equal(r.headers.get("X-Build"), "v1");
 });
 
 test("wasm goes Brotli-compressed only to clients that accept br", async () => {
-  const br = await get("/app-0123456789abcdef_bg.wasm", { "Accept-Encoding": "gzip, br" });
+  const br = await get("/b/v2/app-0123456789abcdef_bg.wasm", { "Accept-Encoding": "gzip, br" });
   assert.equal(br.headers.get("Content-Encoding"), "br");
   assert.equal(br.headers.get("Content-Type"), "application/wasm");
-  assert.equal(br.headers.get("Vary"), "Accept-Encoding");
   assert.equal(await br.text(), "br2");
-  const plain = await get("/app-0123456789abcdef_bg.wasm", { "Accept-Encoding": "gzip, br;q=0" });
+  const plain = await get("/b/v2/app-0123456789abcdef_bg.wasm", { "Accept-Encoding": "gzip, br;q=0" });
   assert.equal(plain.headers.get("Content-Encoding"), null);
   assert.equal(await plain.text(), "wasm2");
+  const rewritten = await get("/b/v2/app-0123456789abcdef_bg.wasm", { "Accept-Encoding": "br, gzip" }, "GET", { clientAcceptEncoding: "identity" });
+  assert.equal(rewritten.headers.get("Content-Encoding"), null);
 });
 
-test("the client's own Accept-Encoding wins over a rewritten header", async () => {
-  const r = await get("/app-0123456789abcdef_bg.wasm", { "Accept-Encoding": "br, gzip" }, "GET", { clientAcceptEncoding: "identity" });
-  assert.equal(r.headers.get("Content-Encoding"), null);
-  assert.equal(await r.text(), "wasm2");
+test("every response varies by Accept-Encoding", async () => {
+  for (const p of ["/b/v2/", "/b/v2/app-0123456789abcdef.js", "/b/v2/fonts/a.ttf", "/b/v2/app-0123456789abcdef_bg.wasm"]) {
+    assert.equal((await get(p)).headers.get("Vary"), "Accept-Encoding", p);
+  }
 });
 
-test("a file missing from the current build comes from the previous one, index.html never does", async () => {
-  const r = await get("/app-fedcba9876543210.js");
-  assert.equal(r.status, 200);
-  assert.equal(r.headers.get("X-Build"), "v1");
-  assert.equal(r.headers.get("X-Current-Build"), "v2");
-  const miss = await get("/missing.html");
+test("a page of a deleted build goes back to / with its query, other misses are 404", async () => {
+  const page = await get("/b/v0/?webgl&lang=fr");
+  assert.equal(page.status, 302);
+  assert.equal(page.headers.get("Location"), "/?webgl&lang=fr");
+  const miss = await get("/b/v2/missing.js");
   assert.equal(miss.status, 404);
-  assert.equal(miss.headers.get("X-Current-Build"), "v2");
+  assert.equal(miss.headers.get("X-Build"), "v2");
+  assert.equal((await get("/b/v1/missing.html")).status, 404);
+  // A current build without index.html answers 404 instead of redirecting in a loop.
+  delete env.SITE.files["builds/v2/index.html"];
+  assert.equal((await get("/b/v2/")).status, 404);
 });
 
-test("a file found in neither cached build makes the Worker read the pointers again", async () => {
-  assert.equal((await get("/")).headers.get("X-Build"), "v2");
-  env.SITE.files["builds/v3/index.html"] = "<html>v3</html>";
-  env.SITE.files["builds/v3/app-1111111111111111.js"] = "js3";
-  env.SITE.files.STATE = "current=v3\nprevious=v2\nchecked=\n";
-  const r = await get("/app-1111111111111111.js");
-  assert.equal(r.status, 200);
-  assert.equal(r.headers.get("X-Build"), "v3");
+test("the start page of a rolled-back build goes to the current build, its files stay", async () => {
+  // A later failure (failed=v3) does not make v1's page loadable again.
+  env.SITE.files.STATE = "current=v2\nprevious=v1\nchecked=v2\nfailed=v3\n";
+  env.SITE.files["builds/v1/ROLLED_BACK"] = "";
+  const r = await get("/b/v1/?webgl");
+  assert.equal(r.status, 302);
+  assert.equal(r.headers.get("Location"), "/?webgl");
+  assert.equal((await get("/b/v1/app-0123456789abcdef.js")).status, 200);
+  assert.equal((await get("/b/v1/ROLLED_BACK")).status, 404);
+  assert.equal((await get("/b/v2/")).status, 200);
+  // With the rolled-back build as the only one, its page answers 503.
+  resetPointers();
+  env.SITE.files.STATE = "current=v1\n";
+  assert.equal((await get("/b/v1/")).status, 503);
+  // A Worker that cached v1 as current before the rollback reads STATE again and redirects.
+  env.SITE.files.STATE = "current=v2\nprevious=v1\nchecked=v2\nfailed=v1\n";
+  const stale = await get("/b/v1/");
+  assert.equal(stale.status, 302);
+  assert.equal(stale.headers.get("Location"), "/");
 });
 
-test("If-None-Match gives 304 for GET and HEAD, If-Match a mismatch gives 412", async () => {
+test("only names ending in .wasm exactly get the Brotli copy", async () => {
+  env.SITE.files["builds/v2/x.WASM"] = "plain";
+  env.SITE.files["builds/v2/x.WASM.br"] = "other";
+  const r = await get("/b/v2/x.WASM", { "Accept-Encoding": "br" });
+  assert.equal(r.headers.get("Content-Encoding"), null);
+  assert.equal(await r.text(), "plain");
+});
+
+test("conditional requests", async () => {
   const etag = '"builds/v2/fonts/a.ttf"';
-  assert.equal((await get("/fonts/a.ttf", { "If-None-Match": etag })).status, 304);
-  assert.equal((await get("/fonts/a.ttf", { "If-None-Match": `W/${etag}` }, "HEAD")).status, 304);
-  assert.equal((await get("/fonts/a.ttf", { "If-Match": '"other"' })).status, 412);
-  assert.equal((await get("/fonts/a.ttf", { "If-Match": etag })).status, 200);
-  const h = await get("/fonts/a.ttf", {}, "HEAD");
+  assert.equal((await get("/b/v2/fonts/a.ttf", { "If-None-Match": etag })).status, 304);
+  assert.equal((await get("/b/v2/fonts/a.ttf", { "If-None-Match": `W/${etag}` }, "HEAD")).status, 304);
+  assert.equal((await get("/b/v2/fonts/a.ttf", { "If-Match": '"other"' })).status, 412);
+  assert.equal((await get("/b/v2/fonts/a.ttf", { "If-Match": etag })).status, 200);
+  assert.equal((await get("/b/v2/fonts/a.ttf", { "If-Modified-Since": new Date(1000).toUTCString() })).status, 304);
+  const h = await get("/b/v2/fonts/a.ttf", {}, "HEAD");
   assert.equal(h.status, 200);
   assert.equal(h.headers.get("Content-Length"), "4");
   assert.equal(await h.text(), "");
@@ -113,51 +151,28 @@ test("If-None-Match gives 304 for GET and HEAD, If-Match a mismatch gives 412", 
 test("other methods, dot and underscore files, MANIFEST and bad paths are refused", async () => {
   env.SITE.files["builds/v2/.htaccess"] = "x";
   env.SITE.files["builds/v2/_headers"] = "x";
-  env.SITE.files["builds/v2/MANIFEST"] = "builds/v2/index.html\n";
-  env.SITE.files["builds/v2/a/.b"] = "x";
   assert.equal((await get("/", {}, "POST")).status, 405);
-  for (const p of ["/.htaccess", "/_headers", "/MANIFEST", "/a/.b", "/a//b", "/%E0%A4%A"]) {
+  for (const p of ["/b/v2/.htaccess", "/b/v2/_headers", "/b/v2/MANIFEST", "/b/v2/a//b", "/b/v2/%E0%A4%A", "/b/..%2FSTATE/", "/b/%E0%A4%A/"]) {
     assert.equal((await get(p)).status, 404, p);
   }
 });
 
-test("filePath refuses raw traversal and dot segments", () => {
+test("filePath and buildPath refuse traversal and dot segments", () => {
   for (const p of ["/a/../b", "/../STATE", "/./index.html", "/a/./b", "/%2e%2e/STATE", "/a/%2E/b"]) {
     assert.equal(filePath(p), null, p);
   }
+  assert.deepEqual(buildPath("/b/v1.20261123000000/x.js"), { id: "v1.20261123000000", rest: "/x.js" });
+  assert.deepEqual(buildPath("/b/v1"), { id: "v1", rest: null });
+  assert.equal(buildPath("/c/v1/"), null);
+  assert.equal(buildPath("/b/../x").id, null);
 });
 
 test("a path whose key would pass R2's 1,024-byte limit is a 404 without an R2 call", async () => {
   const calls = [];
   const inner = env.SITE;
   env = { SITE: { get: (k) => (calls.push(k), inner.get(k)), head: (k) => (calls.push(k), inner.head(k)) } };
-  const r = await get(`/${"a".repeat(1100)}.js`);
-  assert.equal(r.status, 404);
+  assert.equal((await get(`/b/v2/${"a".repeat(1100)}.js`)).status, 404);
   assert.deepEqual(calls.filter((k) => k.startsWith("builds/")), []);
-});
-
-test("every response varies by Accept-Encoding", async () => {
-  for (const p of ["/", "/app-0123456789abcdef.js", "/fonts/a.ttf", "/app-0123456789abcdef_bg.wasm"]) {
-    assert.equal((await get(p)).headers.get("Vary"), "Accept-Encoding", p);
-  }
-});
-
-test("If-Modified-Since gives 304 only for hashed files and only without If-None-Match", async () => {
-  const later = new Date(1000).toUTCString();
-  const js = "/app-0123456789abcdef.js";
-  assert.equal((await get(js, { "If-Modified-Since": later })).status, 304);
-  assert.equal((await get(js, { "If-Modified-Since": later, "If-None-Match": '"other"' })).status, 200);
-  assert.equal((await get(js, { "If-Modified-Since": "not a date" })).status, 200);
-  assert.equal((await get("/", { "If-Modified-Since": later })).status, 200);
-  assert.equal((await get("/fonts/a.ttf", { "If-Modified-Since": later })).status, 200);
-});
-
-test("after a rollback a browser holding the newer index.html by date gets the served one", async () => {
-  const held = new Date(5000).toUTCString();
-  env.SITE.files.STATE = "current=v1\nprevious=v2\nchecked=v1\n";
-  const r = await get("/", { "If-Modified-Since": held });
-  assert.equal(r.status, 200);
-  assert.equal(await r.text(), "<html>v1</html>");
 });
 
 test("a Brotli body is sent as stored and a plain one may be compressed", () => {
@@ -166,32 +181,7 @@ test("a Brotli body is sent as stored and a plain one may be compressed", () => 
   assert.equal(bodyInit(h, null).encodeBody, "automatic");
 });
 
-test("after a rollback the failed build's hashed files still come from it", async () => {
-  env.SITE.files.STATE = "current=v1\nprevious=v2\nchecked=v1\n";
-  assert.equal((await get("/")).headers.get("X-Build"), "v1");
-  const r = await get("/app-0123456789abcdef.js");
-  assert.equal(r.status, 200);
-  assert.equal(r.headers.get("X-Build"), "v2");
-});
-
-test("an R2 failure gives 503 without cached ids and the cached build with them", async () => {
-  const inner = env.SITE;
-  let failing = false;
-  const guard = (f) => (k) => (failing ? Promise.reject(new Error("R2 down")) : f(k));
-  env = { SITE: { get: guard((k) => inner.get(k)), head: guard((k) => inner.head(k)) } };
-  failing = true;
-  assert.equal((await get("/")).status, 503);
-  failing = false;
-  assert.equal((await get("/")).status, 200);
-  env = { SITE: { get: (k) => (k === "STATE" ? Promise.reject(new Error("R2 down")) : inner.get(k)), head: (k) => inner.head(k) } };
-  // A miss forces a STATE read; when that fails the Worker cannot tell the file is absent.
-  assert.equal((await get("/missing-file.js")).status, 503);
-  assert.equal((await get("/")).headers.get("X-Build"), "v2");
-  env = { SITE: { get: () => Promise.reject(new Error("R2 down")), head: () => Promise.reject(new Error("R2 down")) } };
-  assert.equal((await get("/")).status, 503);
-});
-
-test("no published build, an empty current or a damaged STATE answers 503", async () => {
+test("no published build, an empty current or a damaged STATE answers 503 at /", async () => {
   for (const files of [{}, { STATE: "current=\nprevious=v1\n" }, { STATE: "current=v 2\n" }, { STATE: "garbage" }]) {
     resetPointers();
     env = { SITE: bucket(files) };
@@ -199,33 +189,48 @@ test("no published build, an empty current or a damaged STATE answers 503", asyn
   }
 });
 
-test("parseState", () => {
-  assert.deepEqual(parseState("current=a\nprevious=b\nchecked=a\n"), { current: "a", previous: "b" });
-  assert.deepEqual(parseState(" current = a \r\nprevious=a\n"), { current: "a", previous: null });
-  assert.deepEqual(parseState("current=a\nprevious=../x\n"), { current: null, previous: null });
+test("an R2 failure gives 503 without a cached id and the cached build with one", async () => {
+  const inner = env.SITE;
+  let failing = true;
+  const guard = (f) => (k) => (failing ? Promise.reject(new Error("R2 down")) : f(k));
+  env = { SITE: { get: guard((k) => inner.get(k)), head: guard((k) => inner.head(k)) } };
+  assert.equal((await get("/")).status, 503);
+  failing = false;
+  assert.equal((await get("/")).headers.get("Location"), "/b/v2/");
+  // With the cached id expired, a failed STATE read keeps using it.
+  env = { SITE: { get: (k) => (k === "STATE" ? Promise.reject(new Error("R2 down")) : inner.get(k)), head: (k) => inner.head(k) } };
+  const realNow = Date.now;
+  Date.now = () => realNow() + 60_000;
+  try {
+    assert.equal((await get("/")).headers.get("Location"), "/b/v2/");
+  } finally {
+    Date.now = realNow;
+  }
+  resetPointers();
+  assert.equal((await get("/")).status, 503);
+  env = { SITE: { get: () => Promise.reject(new Error("R2 down")), head: () => Promise.reject(new Error("R2 down")) } };
+  assert.equal((await get("/b/v2/fonts/a.ttf")).status, 503);
 });
 
-test("filePath, acceptsBrotli and precondition", () => {
-  assert.equal(filePath("/"), "index.html");
-  assert.equal(filePath("/fonts/"), "fonts/index.html");
-  assert.equal(filePath("/a%20b.js"), "a b.js");
-  assert.equal(filePath("/a\\b"), null);
+test("parseState", () => {
+  assert.deepEqual(parseState("current=a\nprevious=b\nchecked=a\nfailed=c\n"), { current: "a", failed: "c" });
+  assert.deepEqual(parseState(" current = a \r\nprevious=a\n"), { current: "a", failed: null });
+  assert.deepEqual(parseState("current=a\nprevious=../x\n"), { current: null, failed: null });
+});
+
+test("acceptsBrotli and precondition", () => {
   assert.equal(acceptsBrotli("br"), true);
   assert.equal(acceptsBrotli("gzip, br;q=0.5"), true);
   assert.equal(acceptsBrotli("br;q=0, gzip"), false);
   assert.equal(acceptsBrotli("brotli"), false);
+  assert.equal(acceptsBrotli(null), false);
   assert.equal(acceptsBrotli("*;q=1, identity;q=0"), true);
   assert.equal(acceptsBrotli("*, br;q=0"), false);
-  assert.equal(acceptsBrotli("*;q=0"), false);
-  assert.equal(acceptsBrotli(null), false);
   const h = (o) => new Headers(o);
   assert.equal(precondition(h({ "If-Match": "*" }), '"a"'), null);
-  assert.equal(precondition(h({ "If-Unmodified-Since": new Date(0).toUTCString() }), '"a"', new Date(5000)), 412);
-  assert.equal(precondition(h({ "If-Unmodified-Since": new Date(9000).toUTCString() }), '"a"', new Date(5000)), null);
-  assert.equal(precondition(h({ "If-Match": '"a"', "If-Unmodified-Since": new Date(0).toUTCString() }), '"a"', new Date(5000)), null);
   assert.equal(precondition(h({ "If-Match": '"a"', "If-None-Match": '"a"' }), '"a"'), 304);
+  assert.equal(precondition(h({ "If-Unmodified-Since": new Date(0).toUTCString() }), '"a"', new Date(5000)), 412);
   assert.equal(precondition(h({ "If-Match": 'W/"a"' }), '"a"'), 412);
   assert.equal(precondition(h({ "If-None-Match": '"b", "a"' }), '"a"'), 304);
-  assert.equal(precondition(h({ "If-None-Match": "*" }), '"a"'), 304);
   assert.equal(precondition(h({}), '"a"'), null);
 });

@@ -1,15 +1,17 @@
-// Serves one static web build from the R2 bucket bound as SITE.
+// Serves static web builds from the R2 bucket bound as SITE.
 //
 // Bucket layout (written by scripts/publish.sh):
 //   builds/<id>/<path>       the files of one build
 //   builds/<id>/<path>.br    a Brotli copy of each .wasm file
 //   builds/<id>/MANIFEST     every key of the build, one per line
-//   STATE                    lines current=<id>, previous=<id> and checked=<id>
+//   builds/<id>/ROLLED_BACK  present when the build failed its check and was rolled back
+//   STATE                    lines current=<id>, previous=<id>, checked=<id> and failed=<id>
 //   HISTORY                  the ids still kept, oldest first
 //
-// A request is answered from the current build. A file missing there is looked up in the previous
-// build, so a page loaded just before a switch can still fetch the hashed files it names. STATE is
-// cached for 30 seconds; a file found in neither build makes the Worker read it again.
+// Every build is served under its own path, /b/<id>/, and a page loads its files through
+// relative URLs, so a page and everything it loads always come from one build, in every tab and
+// every cache. Any other path redirects to the same path in the current build: / goes to
+// /b/<current>/. STATE is cached for 30 seconds.
 
 const TYPES = {
   html: "text/html; charset=utf-8",
@@ -32,50 +34,52 @@ const TYPES = {
 };
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-const HASHED = /-[0-9a-f]{16}(_bg)?\.(js|wasm)$/;
 const POINTER_TTL_MS = 30_000;
+// R2 refuses keys longer than 1,024 bytes; such a key names no stored file.
+const MAX_KEY_BYTES = 1024;
+const encoder = new TextEncoder();
 
-let pointers = { at: -Infinity, current: null, previous: null };
+const EMPTY = { current: null, failed: null };
+let pointer = { at: -Infinity, ...EMPTY };
 
 export function resetPointers() {
-  pointers = { at: -Infinity, current: null, previous: null };
+  pointer = { at: -Infinity, ...EMPTY };
 }
 
-// Reads current= and previous= from a STATE text. A line that is not key=<id> makes the whole
-// state unusable, so a damaged STATE gives 503 instead of a guess.
+// Reads current= and failed= from a STATE text. A line that is not key=<id> makes the whole state
+// unusable, so a damaged STATE gives 503 instead of a guess.
 export function parseState(text) {
-  const state = { current: null, previous: null };
+  const state = { ...EMPTY };
   for (const raw of text.split("\n")) {
     const line = raw.trim();
     if (line === "") continue;
     const eq = line.indexOf("=");
-    if (eq < 0) return { current: null, previous: null };
+    if (eq < 0) return { ...EMPTY };
     const key = line.slice(0, eq).trim();
     const value = line.slice(eq + 1).trim();
-    if (value !== "" && !ID.test(value)) return { current: null, previous: null };
-    if (key === "current" || key === "previous") state[key] = value || null;
+    if (value !== "" && !ID.test(value)) return { ...EMPTY };
+    if (key === "current" || key === "failed") state[key] = value || null;
   }
-  if (state.previous === state.current) state.previous = null;
   return state;
 }
 
-// The current and previous ids, read again after POINTER_TTL_MS or when `fresh` is set. When an
-// expired read fails and ids are cached, the cached ids are used for another 5 seconds; with nothing
-// cached, or when a `fresh` read fails, the error is thrown (the request then gets 503).
-async function builds(bucket, now, fresh = false) {
-  if (!fresh && now - pointers.at < POINTER_TTL_MS && pointers.current) return pointers;
-  let state;
+// The parsed STATE, read again after POINTER_TTL_MS. When a read fails and a current id is
+// cached, the cached state is used for another 5 seconds; with nothing cached, the error is thrown
+// (the request then gets 503).
+async function readState(bucket, now, fresh = false) {
+  if (!fresh && now - pointer.at < POINTER_TTL_MS && pointer.current) return pointer;
   try {
     const obj = await bucket.get("STATE");
-    state = obj ? parseState(await obj.text()) : { current: null, previous: null };
+    pointer = { at: now, ...(obj ? parseState(await obj.text()) : EMPTY) };
   } catch (error) {
-    // A forced read that fails cannot show a file is absent, so the caller answers 503.
-    if (!pointers.current || fresh) throw error;
-    pointers = { ...pointers, at: now - POINTER_TTL_MS + 5_000 };
-    return pointers;
+    if (!pointer.current) throw error;
+    pointer = { ...pointer, at: now - POINTER_TTL_MS + 5_000 };
   }
-  pointers = { at: now, ...state };
-  return pointers;
+  return pointer;
+}
+
+async function currentBuild(bucket, now) {
+  return (await readState(bucket, now)).current;
 }
 
 // Returns the file path a URL path names, or null when it names no file that may be served.
@@ -93,21 +97,39 @@ export function filePath(pathname) {
   return parts.join("/");
 }
 
-function headersFor(path, obj, encoding) {
-  const ext = path.includes(".") ? path.split(".").pop().toLowerCase() : "";
+// Splits /b/<id>/<rest> into the id and the rest ("/" + rest); null for any other path.
+export function buildPath(pathname) {
+  const m = pathname.match(/^\/b\/([^/]+)(\/.*)?$/);
+  if (!m) return null;
+  let id;
+  try {
+    id = decodeURIComponent(m[1]);
+  } catch {
+    return { id: null, rest: null };
+  }
+  return { id: ID.test(id) ? id : null, rest: m[2] ?? null };
+}
+
+function extension(path) {
+  const base = path.split("/").pop();
+  return base.includes(".") ? base.split(".").pop().toLowerCase() : "";
+}
+
+// A file under /b/<id>/ never changes its bytes: a republished build gets a new id. Pages are still
+// revalidated, so a bookmarked page of a build that was deleted reaches the Worker and is sent to
+// the current build.
+function headersFor(path, obj, encoding, id) {
   const h = new Headers();
+  const ext = extension(path);
   h.set("Content-Type", TYPES[ext] ?? "application/octet-stream");
   h.set("X-Content-Type-Options", "nosniff");
-  // Hashed names never change their bytes. Pages and scripts without a hash are revalidated on
-  // every load, since the page checks scripts against integrity values; other files keep an hour.
-  if (HASHED.test(path)) h.set("Cache-Control", "public, max-age=31536000, immutable");
-  else if (["html", "js", "mjs", "wasm"].includes(ext)) h.set("Cache-Control", "no-cache");
-  else h.set("Cache-Control", "public, max-age=3600");
+  h.set("Cache-Control", ext === "html" ? "no-cache" : "public, max-age=31536000, immutable");
   // Cloudflare compresses text responses on the way out, so every response varies by encoding.
   h.set("Vary", "Accept-Encoding");
   if (encoding) h.set("Content-Encoding", encoding);
   h.set("ETag", obj.httpEtag);
   if (obj.uploaded) h.set("Last-Modified", obj.uploaded.toUTCString());
+  h.set("X-Build", id);
   return h;
 }
 
@@ -140,46 +162,17 @@ function metadataFirst(request) {
 
 // Finds the stored object for a path in one build: its key, metadata (`meta`), encoding and, for an
 // ordinary GET, the object with its body (`obj`), so that GET costs one R2 read.
-// R2 refuses keys longer than 1,024 bytes; such a key names no stored file.
-const MAX_KEY_BYTES = 1024;
-const encoder = new TextEncoder();
-
 async function fromBuild(bucket, request, id, path) {
   const read = metadataFirst(request) ? (k) => bucket.head(k) : (k) => bucket.get(k);
   const key = `builds/${id}/${path}`;
   if (encoder.encode(key).length > MAX_KEY_BYTES) return null;
+  // scripts/publish.sh makes .br copies for names ending in ".wasm" exactly.
   if (path.endsWith(".wasm") && acceptsBrotli(clientAcceptEncoding(request)) && encoder.encode(`${key}.br`).length <= MAX_KEY_BYTES) {
     const found = await read(`${key}.br`);
-    if (found) return { key: `${key}.br`, meta: found, obj: "body" in found ? found : null, encoding: "br", id };
+    if (found) return { key: `${key}.br`, meta: found, obj: "body" in found ? found : null, encoding: "br" };
   }
   const found = await read(key);
-  return found ? { key, meta: found, obj: "body" in found ? found : null, encoding: null, id } : null;
-}
-
-async function findIn(bucket, request, path, ids, tried) {
-  for (const id of ids) {
-    if (!id || tried.has(id)) continue;
-    tried.add(id);
-    const found = await fromBuild(bucket, request, id, path);
-    if (found) return found;
-  }
-  return null;
-}
-
-// Looks in the current build, then (except for .html) the previous one. When neither has the
-// file, STATE is read again and only builds not tried yet are searched.
-async function find(bucket, request, path) {
-  const tried = new Set();
-  let current = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const ids = await builds(bucket, Date.now(), attempt > 0);
-    current = ids.current;
-    if (!current) return { none: true };
-    const html = path.toLowerCase().endsWith(".html");
-    const found = await findIn(bucket, request, path, html ? [current] : [current, ids.previous], tried);
-    if (found) return { ...found, current };
-  }
-  return { missing: true, current };
+  return found ? { key, meta: found, obj: "body" in found ? found : null, encoding: null } : null;
 }
 
 function etagList(value) {
@@ -190,10 +183,9 @@ function etagList(value) {
 }
 
 // 412 or 304 when the request's preconditions say so, else null (RFC 9110 section 13.2.2).
-// If-Match compares strongly and If-None-Match weakly. If-Modified-Since is used only when there is
-// no If-None-Match, and only for hashed file names (`dated`): after a rollback the served copy of
-// any other file is older than the one a browser may hold, so a date would wrongly confirm it.
-export function precondition(headers, etag, uploaded, dated = true) {
+// If-Match compares strongly and If-None-Match weakly; If-Modified-Since and If-Unmodified-Since
+// are used when there is no If-None-Match or If-Match.
+export function precondition(headers, etag, uploaded) {
   const seconds = uploaded ? Math.floor(uploaded.getTime() / 1000) * 1000 : null;
   const ifMatch = headers.get("If-Match");
   if (ifMatch !== null) {
@@ -209,7 +201,6 @@ export function precondition(headers, etag, uploaded, dated = true) {
     const list = etagList(ifNoneMatch).map(weak);
     return list.includes("*") || list.includes(weak(etag)) ? 304 : null;
   }
-  if (!dated) return null;
   const since = Date.parse(headers.get("If-Modified-Since") ?? "");
   if (seconds !== null && Number.isFinite(since) && seconds <= since) return 304;
   return null;
@@ -221,38 +212,72 @@ export function bodyInit(headers, encoding) {
   return { headers, encodeBody: encoding ? "manual" : "automatic" };
 }
 
-function unavailable() {
-  return new Response("The site is not available right now\n", { status: 503, headers: { "Retry-After": "30" } });
+function redirect(location, current = null) {
+  const headers = { Location: location, "Cache-Control": "no-store" };
+  if (current) headers["X-Current-Build"] = current;
+  return new Response(null, { status: 302, headers });
 }
+
+// A 404 for a file under /b/<id>/ names the build in X-Build, so a check can tell this Worker's
+// answer from one that does not know the path layout.
+const notFound = (id = null) => new Response("Not found\n", { status: 404, headers: id ? { "X-Build": id } : {} });
 
 async function serve(request, env) {
   if (request.method !== "GET" && request.method !== "HEAD") {
     return new Response("Method not allowed\n", { status: 405, headers: { Allow: "GET, HEAD" } });
   }
   const url = new URL(request.url);
-  const path = filePath(url.pathname);
+  const build = buildPath(url.pathname);
+
+  if (!build) {
+    // Any other path goes to the same path in the current build.
+    const current = await currentBuild(env.SITE, Date.now());
+    if (!current) return new Response("No build has been published yet\n", { status: 503, headers: { "Retry-After": "300", "Cache-Control": "no-store" } });
+    const rest = url.pathname === "/index.html" ? "/" : url.pathname;
+    return redirect(`/b/${encodeURIComponent(current)}${rest}${url.search}`, current);
+  }
+  if (!build.id) return notFound();
+  if (build.rest === null) return redirect(`/b/${encodeURIComponent(build.id)}/${url.search}`);
+
+  const path = filePath(build.rest);
   // MANIFEST at the top of a build is the bucket's own list of keys, not a site file.
-  if (!path || path === "MANIFEST") return new Response("Not found\n", { status: 404 });
+  if (!path || path === "MANIFEST") return notFound();
 
-  const found = await find(env.SITE, request, path);
-  if (found.none) return new Response("No build has been published yet\n", { status: 503, headers: { "Retry-After": "300" } });
-  if (found.missing) return new Response("Not found\n", { status: 404, headers: { "X-Current-Build": found.current } });
+  // ROLLED_BACK at the top of a build marks a build that failed its check (scripts/rollback.sh
+  // writes it). Its start page goes to the current build, so reloading such a tab recovers, or
+  // answers 503 when no other build is served; the build's other files stay available to pages
+  // that are already running.
+  if (path === "ROLLED_BACK") return notFound();
+  if (path === "index.html" && (await env.SITE.head(`builds/${build.id}/ROLLED_BACK`))) {
+    let current = await currentBuild(env.SITE, Date.now());
+    // A cached id that names the rolled-back build is out of date: read STATE again.
+    if (current === build.id) current = (await readState(env.SITE, Date.now(), true)).current;
+    if (current && current !== build.id) return redirect(`/${url.search}`);
+    return new Response("This build failed its check and no other build is published\n", { status: 503, headers: { "Retry-After": "300", "Cache-Control": "no-store" } });
+  }
 
-  const { key, meta, encoding, id } = found;
+  const found = await fromBuild(env.SITE, request, build.id, path);
+  if (!found) {
+    // A page of a build that was deleted (no index.html left, and not the current build) goes to
+    // the current build with the same query; any other missing file is a 404.
+    if (extension(path) === "html" && !(await env.SITE.head(`builds/${build.id}/index.html`))) {
+      const current = await currentBuild(env.SITE, Date.now());
+      if (current && current !== build.id) return redirect(`/${url.search}`);
+    }
+    return notFound(build.id);
+  }
+
+  const { key, meta, encoding } = found;
   let obj = found.obj;
-  const headers = headersFor(path, meta, encoding);
-  headers.set("X-Build", id);
-  // The build this Worker treats as current; it differs from X-Build when the file came from the
-  // previous build.
-  headers.set("X-Current-Build", found.current);
-  const status = precondition(request.headers, meta.httpEtag, meta.uploaded, HASHED.test(path));
-  if (status === 412) return new Response(null, { status, headers: { "X-Build": id } });
+  const headers = headersFor(path, meta, encoding, build.id);
+  const status = precondition(request.headers, meta.httpEtag, meta.uploaded);
+  if (status === 412) return new Response(null, { status, headers: { "X-Build": build.id } });
   if (status === 304) return new Response(null, { status, headers });
   headers.set("Content-Length", String(meta.size));
   if (request.method === "HEAD") return new Response(null, { headers });
 
   obj ??= await env.SITE.get(key);
-  if (!obj) return new Response("Not found\n", { status: 404 });
+  if (!obj) return notFound();
   if (obj.httpEtag !== meta.httpEtag) {
     headers.set("ETag", obj.httpEtag);
     headers.set("Content-Length", String(obj.size));
@@ -266,7 +291,7 @@ export default {
       return await serve(request, env);
     } catch (error) {
       console.error("request failed", error);
-      return unavailable();
+      return new Response("The site is not available right now\n", { status: 503, headers: { "Retry-After": "30" } });
     }
   },
 };

@@ -3,9 +3,10 @@
 https://vectorcraft.cloud/ serves the web build of the latest VectorCraft release
 (`vectorcraft-web-<version>.zip` from https://github.com/storytold/vectorcraft/releases).
 
-- `src/index.js` is the Cloudflare Worker `vectorcraft-cloud`. It serves the files of the current build from the R2
-  bucket `web-app-site`, sends each `.wasm` file Brotli-compressed to browsers that accept `br`, and adds an
-  `X-Build` header naming the build. The bucket layout is described at the top of the file.
+- `src/index.js` is the Cloudflare Worker `vectorcraft-cloud`. It serves every build in the R2 bucket `web-app-site`
+  under its own path, `/b/<id>/`, and redirects `/` (and any other path) to the current build's path. A page and the
+  files it loads therefore always come from one build. It sends each `.wasm` file Brotli-compressed to browsers that
+  accept `br`, and adds an `X-Build` header naming the build. The bucket layout is described at the top of the file.
 - `.github/workflows/publish.yml` runs every hour at minute 7. When the latest release differs from the served
   build, or the served build has not passed its check, it downloads the release's web zip and uploads it with
   `scripts/publish.sh` as a new build with the id `<tag>.<UTC time>`. It then checks the site with

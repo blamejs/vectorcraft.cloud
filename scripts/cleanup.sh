@@ -53,6 +53,8 @@ for i in "${!ids[@]}"; do
   while IFS= read -r key; do
     if [[ $key == "builds/$gone/"* ]]; then delete "$key" || ok=0; fi
   done <<<"$list"
+  # The marker goes only after every file, so a half-deleted build's page is never served again.
+  if [[ $ok -eq 1 ]]; then delete "builds/$gone/ROLLED_BACK" || ok=0; fi
   if [[ $ok -eq 1 ]] && delete "builds/$gone/MANIFEST"; then continue; fi
   remaining+=("$gone")
   deferred=$((deferred + 1))

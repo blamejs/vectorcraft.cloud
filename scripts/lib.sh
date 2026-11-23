@@ -48,7 +48,22 @@ get_text() {
 
 # bucket_check: exits unless the bucket exists. wrangler reports a missing bucket on `r2 object get`
 # with the same message as a missing key, so the scripts check the bucket before reading STATE.
+# With CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID set (CI), the check asks the R2 bucket
+# endpoint; `wrangler r2 bucket info` also reads bucket metrics, which an R2-only token may not
+# read. Without them (a `wrangler login` session, whose login can read the metrics), it runs
+# `wrangler r2 bucket info`.
 bucket_check() {
+  local code
+  if [[ -n ${CLOUDFLARE_API_TOKEN:-} && -n ${CLOUDFLARE_ACCOUNT_ID:-} ]]; then
+    code=$(curl -sS -o "$work/bucket.json" -w '%{http_code}' --max-time 60 \
+      -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+      "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets/$bucket") || code=000
+    case $code in
+      200) return 0 ;;
+      404) die "bucket $bucket does not exist" ;;
+      *) die "bucket $bucket cannot be read (HTTP $code): $(head -c 300 "$work/bucket.json" 2>/dev/null | tr '\n' ' ')" ;;
+    esac
+  fi
   if ! wr r2 bucket info "$bucket" >/dev/null 2>"$work/bucket.err"; then
     sed -e 's/\x1b\[[0-9;]*m//g' "$work/bucket.err" | grep -vE '^[[:space:]]*$|Logs were written|wrangler [0-9]|^─' >&2 || true
     die "bucket $bucket cannot be read"

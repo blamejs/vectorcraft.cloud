@@ -8,7 +8,9 @@
 # scheduled workflow does not publish the same release again. With --canceled (the check did not
 # finish), failed is left as it was, so the next scheduled run tries the release again. With no
 # checked build, current is emptied: the site answers 503 and the next scheduled run publishes
-# again. A rollback of the build that checked already names is refused, and STATE is not changed.
+# again. Either way builds/<failed-id>/ROLLED_BACK is then written, which sends that build's start
+# page to the current build. A rollback of the build that checked already names is refused, and
+# STATE is not changed.
 # The failed build is deleted by a later scripts/cleanup.sh once it leaves HISTORY and STATE.
 set -euo pipefail
 
@@ -25,6 +27,12 @@ bucket=$1 failed=$2
 
 state_read || die "could not read STATE"
 if [[ $state_current != "$failed" ]]; then
+  # A rollback that switched STATE but stopped before writing the marker is finished here.
+  if [[ $state_previous == "$failed" ]]; then
+    put_text "builds/$failed/ROLLED_BACK" "" || die "could not mark $failed as rolled back"
+    echo "current is ${state_current:-nothing}; $failed is marked as rolled back"
+    exit 0
+  fi
   echo "current is ${state_current:-nothing}, not $failed; nothing to roll back"
   exit 0
 fi
@@ -40,7 +48,10 @@ fi
 if [[ -z $state_checked ]]; then
   state_write "" "$failed" "" "$mark"
   echo "no checked build: nothing is served until the next publish"
-  exit 0
+else
+  state_write "$state_checked" "$failed" "$state_checked" "$mark"
+  echo "current is $state_checked again"
 fi
-state_write "$state_checked" "$failed" "$state_checked" "$mark"
-echo "current is $state_checked again"
+# The marker sends the failed build's start page to the current build (src/index.js). It is
+# written after STATE, so the build is never marked while it is still current.
+put_text "builds/$failed/ROLLED_BACK" "" || die "could not mark $failed as rolled back"

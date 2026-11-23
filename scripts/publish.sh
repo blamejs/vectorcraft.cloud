@@ -16,7 +16,8 @@
 # set, just before STATE.
 #
 # The script exits 2 when the site itself cannot be published (a missing or mismatched file, a name
-# the bucket cannot hold); STATE then records the attempt as failed. Other failures exit 1.
+# the bucket cannot hold, a file over wrangler's 300 MiB upload limit); STATE then records the
+# attempt as failed. Other failures exit 1.
 #
 # Needs CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID in CI, or a `wrangler login` session.
 set -euo pipefail
@@ -55,14 +56,17 @@ files=()
 while IFS= read -r -d '' file; do
   rel=${file#"$dir"/}
   case "/$rel" in */.* | */_*) continue ;; esac
-  [[ $rel != MANIFEST ]] || reject "the site has a top-level file named MANIFEST, which the bucket layout reserves"
-  [[ $rel != *.wasm.br ]] || reject "the site has $rel; the .wasm.br copies are made by this script"
+  [[ $rel != MANIFEST && $rel != ROLLED_BACK ]] || reject "the site has a top-level file named $rel, which the bucket layout reserves"
+  [[ $(printf '%s' "$rel" | tr '[:upper:]' '[:lower:]') != *.wasm.br ]] || reject "the site has $rel; the .wasm.br copies are made by this script"
   # wrangler puts the key into a URL without escaping it, so only these characters are allowed.
   [[ $rel =~ ^[A-Za-z0-9._/-]+$ ]] || reject "the site has a file name wrangler cannot store as a key: $rel"
   # R2 keys are at most 1,024 bytes; these names are ASCII, so length in characters is the size.
   key="builds/$id/$rel"
   [[ $rel != *.wasm ]] || key="$key.br"
   [[ ${#key} -le 1024 ]] || reject "the key for $rel would be longer than R2's 1,024-byte limit"
+  # `wrangler r2 object put` refuses files over 300 MiB.
+  size=$(wc -c <"$file" | tr -d ' ')
+  [[ $size -le 314572800 ]] || reject "$rel is $size bytes; wrangler uploads files of up to 300 MiB"
   files+=("$rel")
 done < <(sort -z "$work/found")
 [[ ${#files[@]} -gt 0 ]] || reject "the site has no files"
@@ -72,17 +76,18 @@ printf '%s\n' "${files[@]}" >"$work/files"
 # Every file the page loads with an integrity value must match it before anything goes live:
 # hashed names are served as immutable, so wrong bytes could stay in browsers after a rollback.
 node "$lib_root/scripts/page-assets.mjs" "$dir/index.html" >"$work/assets" || reject "index.html cannot be checked"
-while IFS=$'\t' read -r path integrity; do
+while IFS=$'\t' read -r path integrity _; do
   [[ -n $path ]] || continue
   grep -qxF -- "$path" "$work/files" || reject "index.html loads $path, which is not a file this script uploads"
-  [[ -n $integrity ]] || continue
+  [[ $integrity != - ]] || continue
   [[ $integrity == sha384-* ]] || reject "$path has an integrity value this script does not read: $integrity"
   got="sha384-$(openssl dgst -sha384 -binary "$dir/$path" | openssl base64 -A)" || die "could not compute the digest of $path"
   [[ $got == "$integrity" ]] || reject "$path does not match its integrity value in index.html"
 done <"$work/assets"
-cut -f 1 "$work/assets" >"$work/asset-paths"
-grep -qE '\.m?js$' "$work/asset-paths" || reject "index.html loads no .js file"
-grep -qE '\.wasm$' "$work/asset-paths" || reject "index.html loads no .wasm file"
+# The page must run a script, not only preload one, and must load a .wasm (an external start-up
+# script may pass a preloaded .wasm to init, which this check cannot see).
+awk -F '\t' '$3 == 1 && $1 ~ /\.m?js$/ { f = 1 } END { exit !f }' "$work/assets" || reject "index.html runs no .js file"
+awk -F '\t' '$1 ~ /\.wasm$/ { f = 1 } END { exit !f }' "$work/assets" || reject "index.html loads no .wasm file"
 
 manifest="$work/MANIFEST"
 : >"$manifest"

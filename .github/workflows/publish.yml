@@ -75,17 +75,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
         run: |
-          mkdir dl site
+          mkdir dl
           zip="vectorcraft-web-${TAG#v}.zip"
           gh release download "$TAG" --repo storytold/vectorcraft --pattern "$zip" --dir dl
           [[ -f dl/$zip ]] || { echo "$TAG has no $zip" >&2; exit 1; }
-          unzip -q "dl/$zip" -d site
-          dirs=(site/*/)
-          [[ ${#dirs[@]} -eq 1 && ! -L ${dirs[0]%/} && -f ${dirs[0]}index.html ]] || { echo "unexpected zip layout" >&2; exit 1; }
-          echo "dir=${dirs[0]%/}" >>"$GITHUB_OUTPUT"
+          dir=$(scripts/unpack.sh "dl/$zip" "$RUNNER_TEMP/unpacked")
+          echo "dir=$dir" >>"$GITHUB_OUTPUT"
+      # The step limits (20 + 12 minutes) leave the rollback time to run inside the job's 45.
       - name: Publish
         id: publish
         if: steps.compare.outputs.changed == 'true'
+        timeout-minutes: 20
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -95,6 +95,7 @@ jobs:
       - name: Check the site
         id: check
         if: steps.publish.outputs.id != ''
+        timeout-minutes: 12
         env:
           ID: ${{ steps.publish.outputs.id }}
         run: scripts/check.sh "$SITE_URL" "$ID"
