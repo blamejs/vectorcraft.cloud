@@ -15,9 +15,9 @@ https://vectorcraft.cloud/ serves the web build of the latest VectorCraft releas
   again. `scripts/cleanup.sh` runs on every run; it keeps the last 3 builds and deletes older ones. Run the workflow
   by hand from the Actions tab; a tag given there is published even when it is already current or failed before,
   and the next scheduled run publishes the latest release again.
-- `scripts/current.sh web-app-site` prints `STATE`: the served build (`current=`), the build used for files missing
-  from it (`previous=`), the last build that passed its check (`checked=`) and the last build that failed it
-  (`failed=`).
+- `scripts/current.sh web-app-site` prints `STATE`: the served build (`current=`), the build served before it
+  (`previous=`, kept by cleanup), the last build that passed its check (`checked=`) and the last build that failed
+  it (`failed=`).
 - The scripts read `STATE` and write it back whole. Do not run them by hand while the workflow is running.
 
 ## Setup
